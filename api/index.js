@@ -97,6 +97,7 @@ u8Q9vCVQAIehzfysfIGo8A==
         const signatureBuffer = sign.sign(privateKeyPem);
         const signatureHex = signatureBuffer.toString('hex');
 
+        // 🔥 FIX: Colon (:) ka use kiya gaya hai taaki C++ client ke sath seamlessly match ho
         const token = `${payloadStr}:${signatureHex}`;
 
         return res.status(200).json({ success: true, token: token });
