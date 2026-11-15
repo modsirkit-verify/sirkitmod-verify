@@ -15,7 +15,6 @@ function fetchFirebaseData(path) {
     });
 }
 
-// Firebase mein device data update karne ke liye function
 function updateFirebaseData(path, dataObj) {
     return new Promise((resolve) => {
         const url = new URL(`${FIREBASE_DB_URL}${path}`);
@@ -24,7 +23,7 @@ function updateFirebaseData(path, dataObj) {
         const reqOptions = {
             hostname: url.hostname,
             path: url.pathname + url.search,
-            method: 'PATCH', // PATCH se existing key ke andar naya data merge ho jayega
+            method: 'PATCH',
             headers: {
                 'Content-Type': 'application/json',
                 'Content-Length': Buffer.byteLength(dataStr)
@@ -70,11 +69,37 @@ module.exports = async (req, res) => {
             return res.status(200).json({ success: false, error: "Security Error: Library CRC Mismatch!" });
         }
 
-        // 🔥 Yahan hum Firebase mein device name aur UUID save kar rahe hain!
+        // 🔥 Dashboard (index.html) ke sath compatible device binding & limit check
+        let devices = keyData.devices || {};
+        if (Array.isArray(devices)) {
+            const obj = {};
+            devices.forEach((d, idx) => {
+                if (typeof d === 'object' && d.uuid) obj[d.uuid] = d;
+                else obj['dev_' + idx] = { uuid: d, model: 'Device', lastLogin: Date.now() };
+            });
+            devices = obj;
+        }
+
+        const deviceKeys = Object.keys(devices);
+        const maxDevices = keyData.maxDevices || 1;
+
+        if (!devices[uuid]) {
+            if (deviceKeys.length >= maxDevices) {
+                return res.status(200).json({ success: false, error: `Device limit reached! Max allowed: ${maxDevices}` });
+            }
+            devices[uuid] = {
+                uuid: uuid,
+                model: deviceModel || "Unknown Device",
+                lastLogin: Date.now()
+            };
+        } else {
+            devices[uuid].lastLogin = Date.now();
+            if (deviceModel) devices[uuid].model = deviceModel;
+        }
+
+        // Firebase mein devices object properly update karein taaki dashboard mein name & count dikhe
         await updateFirebaseData(`/keys/${key}.json`, {
-            last_device_model: deviceModel || "Unknown Device",
-            last_uuid: uuid,
-            last_login: new Date().toISOString()
+            devices: devices
         });
 
         const privateKeyPem = process.env.SERVER_PRIVATE_KEY || `-----BEGIN PRIVATE KEY-----
