@@ -15,6 +15,34 @@ function fetchFirebaseData(path) {
     });
 }
 
+// Firebase mein device data update karne ke liye function
+function updateFirebaseData(path, dataObj) {
+    return new Promise((resolve) => {
+        const url = new URL(`${FIREBASE_DB_URL}${path}`);
+        const dataStr = JSON.stringify(dataObj);
+        
+        const reqOptions = {
+            hostname: url.hostname,
+            path: url.pathname + url.search,
+            method: 'PATCH', // PATCH se existing key ke andar naya data merge ho jayega
+            headers: {
+                'Content-Type': 'application/json',
+                'Content-Length': Buffer.byteLength(dataStr)
+            }
+        };
+
+        const req = https.request(reqOptions, (res) => {
+            let resData = '';
+            res.on('data', chunk => resData += chunk);
+            res.on('end', () => resolve(true));
+        });
+
+        req.on('error', () => resolve(false));
+        req.write(dataStr);
+        req.end();
+    });
+}
+
 module.exports = async (req, res) => {
     if (req.method !== 'POST') {
         return res.status(405).json({ success: false, error: "Method Not Allowed" });
@@ -22,15 +50,13 @@ module.exports = async (req, res) => {
 
     try {
         const body = req.body || {};
-        const { key, uuid, localCrc, role, nonce } = body;
+        const { key, uuid, deviceModel, localCrc, role, nonce } = body;
 
-        // Nonce aur UUID check zaroori hai
         if (!key || !uuid || !nonce) {
             return res.status(200).json({ success: false, error: "Key, UUID and Nonce required!" });
         }
 
         const keyData = await fetchFirebaseData(`/keys/${key}.json`);
-        const sysSettings = await fetchFirebaseData(`/system_settings/lib_integrity.json`);
 
         if (!keyData) {
             return res.status(200).json({ success: false, error: "Key does not exist!" });
@@ -44,7 +70,13 @@ module.exports = async (req, res) => {
             return res.status(200).json({ success: false, error: "Security Error: Library CRC Mismatch!" });
         }
 
-        // Server Private Key (Vercel Environment Variables mein 'SERVER_PRIVATE_KEY' naam se save karein)
+        // 🔥 Yahan hum Firebase mein device name aur UUID save kar rahe hain!
+        await updateFirebaseData(`/keys/${key}.json`, {
+            last_device_model: deviceModel || "Unknown Device",
+            last_uuid: uuid,
+            last_login: new Date().toISOString()
+        });
+
         const privateKeyPem = process.env.SERVER_PRIVATE_KEY || `-----BEGIN PRIVATE KEY-----
 MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQCz9Sl59WECdgHo
 yTsFEH1DTQ+UP5pLtD3lV12GiGTHtCzD8eH4DfyKKqamOT9gYKY6jKjL3p8TbndK
@@ -75,10 +107,9 @@ u8Q9vCVQAIehzfysfIGo8A==
 -----END PRIVATE KEY-----`;
 
         const now = Math.floor(Date.now() / 1000);
-        const exp = now + 3600; // Token 1 ghante tak valid rahega
+        const exp = now + 3600; 
         const assignedRole = role || "user";
 
-        // Claims payload jo C++ client validate karega
         const payloadData = { 
             app: "com.alfas.xD", 
             iat: now,
@@ -90,14 +121,12 @@ u8Q9vCVQAIehzfysfIGo8A==
         
         const payloadStr = JSON.stringify(payloadData);
         
-        // RSA-SHA256 Signature Generate karna (C++ client compatibility ke liye)
         const sign = crypto.createSign('SHA256');
         sign.update(payloadStr);
         sign.end();
         const signatureBuffer = sign.sign(privateKeyPem);
         const signatureHex = signatureBuffer.toString('hex');
 
-        // 🔥 FIX: Colon (:) ka use kiya gaya hai taaki C++ client ke sath seamlessly match ho
         const token = `${payloadStr}:${signatureHex}`;
 
         return res.status(200).json({ success: true, token: token });
