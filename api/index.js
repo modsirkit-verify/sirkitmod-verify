@@ -65,7 +65,7 @@ module.exports = async (req, res) => {
             return res.status(200).json({ success: false, error: "Key is Expired or Revoked!" });
         }
 
-        // 🔥 Bulletproof CRC Verification (No Auto-Register, Strict Panel-Locked Hash Matching)
+        // 🔥 Strict Single-Mod Binding Per Key (Mod A key runs Mod A only, Mod B key runs Mod B only)
         const clientCrc = String(localCrc || '').trim().toUpperCase();
         let clientHex = clientCrc;
         if (/^[0-9]+$/.test(localCrc.trim())) {
@@ -73,34 +73,38 @@ module.exports = async (req, res) => {
             clientHex = '0x' + num.toString(16).toUpperCase().padStart(8, '0');
         }
 
-        if (keyData.expectedCrc32) {
-            const dbCrcHex = String(keyData.expectedCrc32).trim().toUpperCase();
-            const dbCrcDec = keyData.expectedCrc32Dec ? String(keyData.expectedCrc32Dec).trim() : '';
-            
-            let clientDec = clientCrc;
-            if (/^[0-9]+$/.test(localCrc.trim())) {
-                clientDec = parseInt(localCrc.trim(), 10).toString(10);
-            } else if (/^0x[0-9a-fA-F]+$/i.test(localCrc.trim())) {
-                clientDec = parseInt(localCrc.trim(), 16).toString(10);
-            }
-
-            const isMatch = (clientHex === dbCrcHex) || 
-                            (clientDec === dbCrcDec) || 
-                            (clientCrc === dbCrcHex) || 
-                            (clientCrc === dbCrcDec);
-
-            // ❌ Agar mod cracked hai ya hash match nahi hua, toh login sarasar reject!
-            if (!isMatch) {
-                return res.status(200).json({ 
-                    success: false, 
-                    error: `Security Error: Library CRC Mismatch! (Cracked or Modified Build Detected)` 
+        if (clientHex) {
+            if (!keyData.expectedCrc32) {
+                // Jab pehli baar is key se login ho, toh jis mod ka build hoga uska hash is key ke sath lock ho jayega.
+                await updateFirebaseData(`/keys/${key}.json`, {
+                    expectedCrc32: clientHex,
+                    expectedCrc32Dec: /^[0-9]+$/.test(localCrc.trim()) ? localCrc.trim() : ''
                 });
+                keyData.expectedCrc32 = clientHex;
+            } else {
+                // Strict check: Agar key ke andar Mod A ka hash locked hai, toh client ko Mod A hi bhejna padega!
+                const dbCrcHex = String(keyData.expectedCrc32).trim().toUpperCase();
+                const dbCrcDec = keyData.expectedCrc32Dec ? String(keyData.expectedCrc32Dec).trim() : '';
+                
+                let clientDec = clientCrc;
+                if (/^[0-9]+$/.test(localCrc.trim())) {
+                    clientDec = parseInt(localCrc.trim(), 10).toString(10);
+                } else if (/^0x[0-9a-fA-F]+$/i.test(localCrc.trim())) {
+                    clientDec = parseInt(localCrc.trim(), 16).toString(10);
+                }
+
+                const isMatch = (clientHex === dbCrcHex) || 
+                                (clientDec === dbCrcDec) || 
+                                (clientCrc === dbCrcHex) || 
+                                (clientCrc === dbCrcDec);
+
+                if (!isMatch) {
+                    return res.status(200).json({ 
+                        success: false, 
+                        error: `Security Error: This key is not valid for this Mod version!` 
+                    });
+                }
             }
-        } else {
-            return res.status(200).json({ 
-                success: false, 
-                error: `Security Error: Key is not bound to any official Library Build!` 
-            });
         }
 
         // Dashboard ke sath compatible device binding & limit check
