@@ -65,7 +65,7 @@ module.exports = async (req, res) => {
             return res.status(200).json({ success: false, error: "Key is Expired or Revoked!" });
         }
 
-        // 🔥 Secure & Strict CRC Verification (No Fake Hash Overwriting / Anti-Cheat Bypass)
+        // 🔥 Bulletproof CRC Verification (No Auto-Register, Strict Panel-Locked Hash Matching)
         const clientCrc = String(localCrc || '').trim().toUpperCase();
         let clientHex = clientCrc;
         if (/^[0-9]+$/.test(localCrc.trim())) {
@@ -73,39 +73,34 @@ module.exports = async (req, res) => {
             clientHex = '0x' + num.toString(16).toUpperCase().padStart(8, '0');
         }
 
-        if (clientHex) {
-            if (keyData.expectedCrc32) {
-                // Agar database mein hash pehle se locked hai, toh strict match check karenge
-                const dbCrcHex = String(keyData.expectedCrc32).trim().toUpperCase();
-                const dbCrcDec = keyData.expectedCrc32Dec ? String(keyData.expectedCrc32Dec).trim() : '';
-                
-                let clientDec = clientCrc;
-                if (/^[0-9]+$/.test(localCrc.trim())) {
-                    clientDec = parseInt(localCrc.trim(), 10).toString(10);
-                } else if (/^0x[0-9a-fA-F]+$/i.test(localCrc.trim())) {
-                    clientDec = parseInt(localCrc.trim(), 16).toString(10);
-                }
-
-                const isMatch = (clientHex === dbCrcHex) || 
-                                (clientDec === dbCrcDec) || 
-                                (clientCrc === dbCrcHex) || 
-                                (clientCrc === dbCrcDec);
-
-                // ❌ Agar match nahi hua, toh turant block karo (Fake hash ko accept nahi kiya jayega)
-                if (!isMatch) {
-                    return res.status(200).json({ 
-                        success: false, 
-                        error: `Security Error: Library CRC Mismatch! (Unauthorized Modification Detected)` 
-                    });
-                }
-            } else {
-                // Sirf pehli baar (jab database mein CRC blank ho) auto-register hoga
-                await updateFirebaseData(`/keys/${key}.json`, {
-                    expectedCrc32: clientHex,
-                    expectedCrc32Dec: /^[0-9]+$/.test(localCrc.trim()) ? localCrc.trim() : ''
-                });
-                keyData.expectedCrc32 = clientHex;
+        if (keyData.expectedCrc32) {
+            const dbCrcHex = String(keyData.expectedCrc32).trim().toUpperCase();
+            const dbCrcDec = keyData.expectedCrc32Dec ? String(keyData.expectedCrc32Dec).trim() : '';
+            
+            let clientDec = clientCrc;
+            if (/^[0-9]+$/.test(localCrc.trim())) {
+                clientDec = parseInt(localCrc.trim(), 10).toString(10);
+            } else if (/^0x[0-9a-fA-F]+$/i.test(localCrc.trim())) {
+                clientDec = parseInt(localCrc.trim(), 16).toString(10);
             }
+
+            const isMatch = (clientHex === dbCrcHex) || 
+                            (clientDec === dbCrcDec) || 
+                            (clientCrc === dbCrcHex) || 
+                            (clientCrc === dbCrcDec);
+
+            // ❌ Agar mod cracked hai ya hash match nahi hua, toh login sarasar reject!
+            if (!isMatch) {
+                return res.status(200).json({ 
+                    success: false, 
+                    error: `Security Error: Library CRC Mismatch! (Cracked or Modified Build Detected)` 
+                });
+            }
+        } else {
+            return res.status(200).json({ 
+                success: false, 
+                error: `Security Error: Key is not bound to any official Library Build!` 
+            });
         }
 
         // Dashboard ke sath compatible device binding & limit check
