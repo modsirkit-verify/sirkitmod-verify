@@ -65,6 +65,21 @@ module.exports = async (req, res) => {
             return res.status(200).json({ success: false, error: "Key is Expired or Revoked!" });
         }
 
+        // 🔥 Auto-Sync CRC: Agar database mein hash nahi hai, toh pehli baar jo aayega wahi save ho jayega!
+        if (!keyData.expectedCrc32 && localCrc) {
+            const initialCrc = String(localCrc).trim().toUpperCase();
+            let initialHex = initialCrc;
+            if (/^[0-9]+$/.test(localCrc.trim())) {
+                const num = parseInt(localCrc.trim(), 10) >>> 0;
+                initialHex = '0x' + num.toString(16).toUpperCase().padStart(8, '0');
+            }
+            await updateFirebaseData(`/keys/${key}.json`, {
+                expectedCrc32: initialHex,
+                expectedCrc32Dec: /^[0-9]+$/.test(localCrc.trim()) ? localCrc.trim() : ''
+            });
+            keyData.expectedCrc32 = initialHex;
+        }
+
         // 🔥 Robust CRC Verification (Hex, Decimal & Fallback support)
         if (keyData.expectedCrc32 && localCrc) {
             const dbCrcHex = String(keyData.expectedCrc32).trim().toUpperCase();
@@ -125,6 +140,7 @@ module.exports = async (req, res) => {
             if (deviceModel) devices[uuid].model = deviceModel;
         }
 
+        // Firebase mein devices object properly update karein taaki dashboard mein name & count dikhe
         await updateFirebaseData(`/keys/${key}.json`, {
             devices: devices
         });
