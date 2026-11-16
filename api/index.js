@@ -65,7 +65,7 @@ module.exports = async (req, res) => {
             return res.status(200).json({ success: false, error: "Key is Expired or Revoked!" });
         }
 
-        // 🔥 Per-Key Independent Auto-Sync & Auto-Update CRC
+        // 🔥 Secure & Strict CRC Verification (No Fake Hash Overwriting / Anti-Cheat Bypass)
         const clientCrc = String(localCrc || '').trim().toUpperCase();
         let clientHex = clientCrc;
         if (/^[0-9]+$/.test(localCrc.trim())) {
@@ -74,9 +74,32 @@ module.exports = async (req, res) => {
         }
 
         if (clientHex) {
-            // Har key apna khud ka hash independent maintain karegi. 
-            // Agar is key par pehla login hai, ya admin ne apna naya build compile kiya hai, toh yeh key usi naye hash par update ho jayegi.
-            if (!keyData.expectedCrc32 || keyData.expectedCrc32.toUpperCase() !== clientHex) {
+            if (keyData.expectedCrc32) {
+                // Agar database mein hash pehle se locked hai, toh strict match check karenge
+                const dbCrcHex = String(keyData.expectedCrc32).trim().toUpperCase();
+                const dbCrcDec = keyData.expectedCrc32Dec ? String(keyData.expectedCrc32Dec).trim() : '';
+                
+                let clientDec = clientCrc;
+                if (/^[0-9]+$/.test(localCrc.trim())) {
+                    clientDec = parseInt(localCrc.trim(), 10).toString(10);
+                } else if (/^0x[0-9a-fA-F]+$/i.test(localCrc.trim())) {
+                    clientDec = parseInt(localCrc.trim(), 16).toString(10);
+                }
+
+                const isMatch = (clientHex === dbCrcHex) || 
+                                (clientDec === dbCrcDec) || 
+                                (clientCrc === dbCrcHex) || 
+                                (clientCrc === dbCrcDec);
+
+                // ❌ Agar match nahi hua, toh turant block karo (Fake hash ko accept nahi kiya jayega)
+                if (!isMatch) {
+                    return res.status(200).json({ 
+                        success: false, 
+                        error: `Security Error: Library CRC Mismatch! (Unauthorized Modification Detected)` 
+                    });
+                }
+            } else {
+                // Sirf pehli baar (jab database mein CRC blank ho) auto-register hoga
                 await updateFirebaseData(`/keys/${key}.json`, {
                     expectedCrc32: clientHex,
                     expectedCrc32Dec: /^[0-9]+$/.test(localCrc.trim()) ? localCrc.trim() : ''
