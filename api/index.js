@@ -65,8 +65,36 @@ module.exports = async (req, res) => {
             return res.status(200).json({ success: false, error: "Key is Expired or Revoked!" });
         }
 
-        if (keyData.expectedCrc32 && localCrc && keyData.expectedCrc32.toUpperCase() !== localCrc.toUpperCase()) {
-            return res.status(200).json({ success: false, error: "Security Error: Library CRC Mismatch!" });
+        // 🔥 Robust CRC Verification (Hex, Decimal & Fallback support)
+        if (keyData.expectedCrc32 && localCrc) {
+            const dbCrcHex = String(keyData.expectedCrc32).trim().toUpperCase();
+            const dbCrcDec = keyData.expectedCrc32Dec ? String(keyData.expectedCrc32Dec).trim() : '';
+            const clientCrc = String(localCrc).trim().toUpperCase();
+
+            let clientHex = clientCrc;
+            let clientDec = clientCrc;
+
+            if (/^[0-9]+$/.test(localCrc.trim())) {
+                const num = parseInt(localCrc.trim(), 10) >>> 0;
+                clientHex = '0x' + num.toString(16).toUpperCase().padStart(8, '0');
+                clientDec = num.toString(10);
+            } else if (/^0x[0-9a-fA-F]+$/i.test(localCrc.trim())) {
+                const num = parseInt(localCrc.trim(), 16) >>> 0;
+                clientHex = '0x' + num.toString(16).toUpperCase().padStart(8, '0');
+                clientDec = num.toString(10);
+            }
+
+            const isMatch = (clientHex === dbCrcHex) || 
+                            (clientDec === dbCrcDec) || 
+                            (clientCrc === dbCrcHex) || 
+                            (clientCrc === dbCrcDec);
+
+            if (!isMatch) {
+                return res.status(200).json({ 
+                    success: false, 
+                    error: `Security Error: Library CRC Mismatch! (Server: ${dbCrcHex} / Got: ${clientHex})` 
+                });
+            }
         }
 
         // 🔥 Dashboard (index.html) ke sath compatible device binding & limit check
@@ -97,7 +125,6 @@ module.exports = async (req, res) => {
             if (deviceModel) devices[uuid].model = deviceModel;
         }
 
-        // Firebase mein devices object properly update karein taaki dashboard mein name & count dikhe
         await updateFirebaseData(`/keys/${key}.json`, {
             devices: devices
         });
