@@ -65,54 +65,27 @@ module.exports = async (req, res) => {
             return res.status(200).json({ success: false, error: "Key is Expired or Revoked!" });
         }
 
-        // 🔥 Auto-Sync CRC: Agar database mein hash nahi hai, toh pehli baar jo aayega wahi save ho jayega!
-        if (!keyData.expectedCrc32 && localCrc) {
-            const initialCrc = String(localCrc).trim().toUpperCase();
-            let initialHex = initialCrc;
-            if (/^[0-9]+$/.test(localCrc.trim())) {
-                const num = parseInt(localCrc.trim(), 10) >>> 0;
-                initialHex = '0x' + num.toString(16).toUpperCase().padStart(8, '0');
-            }
-            await updateFirebaseData(`/keys/${key}.json`, {
-                expectedCrc32: initialHex,
-                expectedCrc32Dec: /^[0-9]+$/.test(localCrc.trim()) ? localCrc.trim() : ''
-            });
-            keyData.expectedCrc32 = initialHex;
+        // 🔥 Per-Key Independent Auto-Sync & Auto-Update CRC
+        const clientCrc = String(localCrc || '').trim().toUpperCase();
+        let clientHex = clientCrc;
+        if (/^[0-9]+$/.test(localCrc.trim())) {
+            const num = parseInt(localCrc.trim(), 10) >>> 0;
+            clientHex = '0x' + num.toString(16).toUpperCase().padStart(8, '0');
         }
 
-        // 🔥 Robust CRC Verification (Hex, Decimal & Fallback support)
-        if (keyData.expectedCrc32 && localCrc) {
-            const dbCrcHex = String(keyData.expectedCrc32).trim().toUpperCase();
-            const dbCrcDec = keyData.expectedCrc32Dec ? String(keyData.expectedCrc32Dec).trim() : '';
-            const clientCrc = String(localCrc).trim().toUpperCase();
-
-            let clientHex = clientCrc;
-            let clientDec = clientCrc;
-
-            if (/^[0-9]+$/.test(localCrc.trim())) {
-                const num = parseInt(localCrc.trim(), 10) >>> 0;
-                clientHex = '0x' + num.toString(16).toUpperCase().padStart(8, '0');
-                clientDec = num.toString(10);
-            } else if (/^0x[0-9a-fA-F]+$/i.test(localCrc.trim())) {
-                const num = parseInt(localCrc.trim(), 16) >>> 0;
-                clientHex = '0x' + num.toString(16).toUpperCase().padStart(8, '0');
-                clientDec = num.toString(10);
-            }
-
-            const isMatch = (clientHex === dbCrcHex) || 
-                            (clientDec === dbCrcDec) || 
-                            (clientCrc === dbCrcHex) || 
-                            (clientCrc === dbCrcDec);
-
-            if (!isMatch) {
-                return res.status(200).json({ 
-                    success: false, 
-                    error: `Security Error: Library CRC Mismatch! (Server: ${dbCrcHex} / Got: ${clientHex})` 
+        if (clientHex) {
+            // Har key apna khud ka hash independent maintain karegi. 
+            // Agar is key par pehla login hai, ya admin ne apna naya build compile kiya hai, toh yeh key usi naye hash par update ho jayegi.
+            if (!keyData.expectedCrc32 || keyData.expectedCrc32.toUpperCase() !== clientHex) {
+                await updateFirebaseData(`/keys/${key}.json`, {
+                    expectedCrc32: clientHex,
+                    expectedCrc32Dec: /^[0-9]+$/.test(localCrc.trim()) ? localCrc.trim() : ''
                 });
+                keyData.expectedCrc32 = clientHex;
             }
         }
 
-        // 🔥 Dashboard (index.html) ke sath compatible device binding & limit check
+        // Dashboard ke sath compatible device binding & limit check
         let devices = keyData.devices || {};
         if (Array.isArray(devices)) {
             const obj = {};
@@ -140,7 +113,6 @@ module.exports = async (req, res) => {
             if (deviceModel) devices[uuid].model = deviceModel;
         }
 
-        // Firebase mein devices object properly update karein taaki dashboard mein name & count dikhe
         await updateFirebaseData(`/keys/${key}.json`, {
             devices: devices
         });
