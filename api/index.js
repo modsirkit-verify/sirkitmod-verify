@@ -80,6 +80,14 @@ module.exports = async (req, res) => {
             clientHex = '0x' + num.toString(16).toUpperCase().padStart(8, '0');
         }
 
+        // 🔍 DEBUGGING LOGS (Vercel Dashboard -> Logs mein yeh dikhega)
+        console.log("-----------------------------------------");
+        console.log("KEY CHECK:", key);
+        console.log("DB expectedCrc32:", keyData.expectedCrc32);
+        console.log("Client raw localCrc:", localCrc);
+        console.log("Converted clientHex:", clientHex);
+        console.log("-----------------------------------------");
+
         if (clientHex) {
             const dbCrcHex = String(keyData.expectedCrc32).trim().toUpperCase();
             const dbCrcDec = keyData.expectedCrc32Dec ? String(keyData.expectedCrc32Dec).trim() : '';
@@ -97,6 +105,7 @@ module.exports = async (req, res) => {
                             (clientCrc === dbCrcDec);
 
             if (!isMatch) {
+                console.log("❌ CRC MISMATCH DETECTED! DB:", dbCrcHex, "VS Client:", clientHex);
                 return res.status(200).json({ 
                     success: false, 
                     error: `Security Error: Library CRC Mismatch! (Wrong Mod Version for this Key)` 
