@@ -1,205 +1,254 @@
+'use strict';
+
 const crypto = require('crypto');
-const https = require('https');
+const admin = require('firebase-admin');
 
-const FIREBASE_DB_URL = "https://modsirkit-a625b-default-rtdb.firebaseio.com";
+const FIREBASE_DB_URL = 'https://modsirkit-a625b-default-rtdb.firebaseio.com';
+const APP_ID = 'com.alfas.xD';
+const ALLOWED_ROLES = new Set(['user', 'admin', 'owner']);
+const MAX_CLOCK_SKEW_SECONDS = 300;
+const TOKEN_LIFETIME_SECONDS = 60 * 60;
 
-function fetchFirebaseData(path) {
-    return new Promise((resolve) => {
-        https.get(`${FIREBASE_DB_URL}${path}`, (res) => {
-            let data = '';
-            res.on('data', chunk => data += chunk);
-            res.on('end', () => {
-                try { resolve(JSON.parse(data)); } catch (e) { resolve(null); }
-            });
-        }).on('error', () => resolve(null));
-    });
+function send(res, status, body) {
+  res.setHeader('Cache-Control', 'no-store, max-age=0');
+  res.setHeader('Pragma', 'no-cache');
+  return res.status(status).json(body);
 }
 
-function updateFirebaseData(path, dataObj) {
-    return new Promise((resolve) => {
-        const url = new URL(`${FIREBASE_DB_URL}${path}`);
-        const dataStr = JSON.stringify(dataObj);
-        
-        const reqOptions = {
-            hostname: url.hostname,
-            path: url.pathname + url.search,
-            method: 'PATCH',
-            headers: {
-                'Content-Type': 'application/json',
-                'Content-Length': Buffer.byteLength(dataStr)
-            }
-        };
+function getDatabase() {
+  if (!admin.apps.length) {
+    const rawServiceAccount = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+    if (!rawServiceAccount) {
+      throw new Error('FIREBASE_SERVICE_ACCOUNT_JSON is not configured');
+    }
 
-        const req = https.request(reqOptions, (res) => {
-            let resData = '';
-            res.on('data', chunk => resData += chunk);
-            res.on('end', () => resolve(true));
-        });
+    const serviceAccount = JSON.parse(rawServiceAccount);
+    if (typeof serviceAccount.private_key === 'string') {
+      serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n');
+    }
 
-        req.on('error', () => resolve(false));
-        req.write(dataStr);
-        req.end();
+    admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount),
+      databaseURL: FIREBASE_DB_URL
     });
+  }
+  return admin.database();
+}
+
+function getSigningKey() {
+  const raw = process.env.SERVER_PRIVATE_KEY;
+  if (!raw) throw new Error('SERVER_PRIVATE_KEY is not configured');
+
+  const pem = raw.replace(/\\n/g, '\n');
+  const key = crypto.createPrivateKey(pem);
+  const details = key.asymmetricKeyDetails || {};
+  if (key.asymmetricKeyType !== 'rsa' || !details.modulusLength || details.modulusLength < 2048) {
+    throw new Error('SERVER_PRIVATE_KEY must be an RSA key of at least 2048 bits');
+  }
+  return key;
+}
+
+function parseCrc32(value) {
+  if (typeof value === 'number') {
+    if (!Number.isInteger(value) || value < 0 || value > 0xFFFFFFFF) return null;
+    return value >>> 0;
+  }
+
+  if (typeof value !== 'string' && typeof value !== 'number') return null;
+  const text = String(value).trim();
+  if (/^0x[0-9a-f]{1,8}$/i.test(text)) return parseInt(text.slice(2), 16) >>> 0;
+  if (/^[0-9]{1,10}$/.test(text)) {
+    const number = Number(text);
+    if (!Number.isSafeInteger(number) || number < 0 || number > 0xFFFFFFFF) return null;
+    return number >>> 0;
+  }
+  if (/^[0-9a-f]{1,8}$/i.test(text) && /[a-f]/i.test(text)) return parseInt(text, 16) >>> 0;
+  return null;
+}
+
+function crcMatches(keyData, clientCrc) {
+  const actual = parseCrc32(clientCrc);
+  const expected = parseCrc32(keyData.expectedCrc32) ?? parseCrc32(keyData.expectedCrc32Dec);
+  return actual !== null && expected !== null && actual === expected;
+}
+
+function normalizeDevices(value) {
+  if (Array.isArray(value)) {
+    const result = {};
+    value.forEach((device, index) => {
+      if (device && typeof device === 'object' && typeof device.uuid === 'string') {
+        result[device.uuid] = device;
+      } else if (typeof device === 'string') {
+        result[`legacy_${index}`] = {
+          uuid: device,
+          model: 'Device',
+          lastLogin: 0
+        };
+      }
+    });
+    return result;
+  }
+  if (value && typeof value === 'object') return { ...value };
+  return {};
+}
+
+function trustedRole(keyData) {
+  const value = typeof keyData.role === 'string' ? keyData.role.toLowerCase() : 'user';
+  return ALLOWED_ROLES.has(value) ? value : 'user';
+}
+
+function validFirebaseKey(value) {
+  return typeof value === 'string' && /^[A-Za-z0-9_-]{5,50}$/.test(value);
+}
+
+function validUuid(value) {
+  // Firebase child keys cannot contain . # $ [ ] / or control characters.
+  return typeof value === 'string' && value.length >= 8 && value.length <= 128 &&
+    /^[A-Za-z0-9:_-]+$/.test(value);
+}
+
+function safeDeviceModel(value) {
+  if (typeof value !== 'string') return 'Unknown Device';
+  const cleaned = value.replace(/[\u0000-\u001F\u007F]/g, '').trim().slice(0, 80);
+  return cleaned || 'Unknown Device';
+}
+
+function isActiveKey(data) {
+  return !!data && typeof data === 'object' && data.status === 'ACTIVE';
 }
 
 module.exports = async (req, res) => {
-    if (req.method !== 'POST') {
-        return res.status(405).json({ success: false, error: "Method Not Allowed" });
+  if (req.method !== 'POST') {
+    return send(res, 405, { success: false, error: 'Method Not Allowed' });
+  }
+
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const { key, uuid, deviceModel, localCrc, nonce, appId, clientTime } = body;
+
+    if (!validFirebaseKey(key) || !validUuid(uuid) ||
+        typeof nonce !== 'string' || !/^[0-9a-f]{64}$/i.test(nonce) ||
+        appId !== APP_ID || typeof clientTime !== 'number' || !Number.isSafeInteger(clientTime)) {
+      return send(res, 400, { success: false, error: 'Invalid login request' });
     }
 
-    try {
-        const body = req.body || {};
-        const { key, uuid, deviceModel, localCrc, role, nonce } = body;
-
-        if (!key || !uuid || !nonce) {
-            return res.status(200).json({ success: false, error: "Key, UUID and Nonce required!" });
-        }
-
-        const keyData = await fetchFirebaseData(`/keys/${key}.json`);
-
-        if (!keyData) {
-            return res.status(200).json({ success: false, error: "Key does not exist!" });
-        }
-
-        if (keyData.status && keyData.status !== 'ACTIVE') {
-            return res.status(200).json({ success: false, error: "Key is Expired or Revoked!" });
-        }
-
-        // 🔥 Strict Enforcement: Auto-binding removed! Key MUST have pre-configured CRC from SirkitMod Panel.
-        if (!keyData.expectedCrc32) {
-            return res.status(200).json({ 
-                success: false, 
-                error: `Security Error: Invalid Key Source! (Please use SirkitMod Panel)` 
-            });
-        }
-
-        const clientCrc = String(localCrc || '').trim().toUpperCase();
-        let clientHex = clientCrc;
-        if (/^[0-9]+$/.test(localCrc.trim())) {
-            const num = parseInt(localCrc.trim(), 10) >>> 0;
-            clientHex = '0x' + num.toString(16).toUpperCase().padStart(8, '0');
-        }
-
-        // 🔍 DEBUGGING LOGS (Vercel Dashboard -> Logs mein yeh dikhega)
-        console.log("-----------------------------------------");
-        console.log("KEY CHECK:", key);
-        console.log("DB expectedCrc32:", keyData.expectedCrc32);
-        console.log("Client raw localCrc:", localCrc);
-        console.log("Converted clientHex:", clientHex);
-        console.log("-----------------------------------------");
-
-        if (clientHex) {
-            const dbCrcHex = String(keyData.expectedCrc32).trim().toUpperCase();
-            const dbCrcDec = keyData.expectedCrc32Dec ? String(keyData.expectedCrc32Dec).trim() : '';
-            
-            let clientDec = clientCrc;
-            if (/^[0-9]+$/.test(localCrc.trim())) {
-                clientDec = parseInt(localCrc.trim(), 10).toString(10);
-            } else if (/^0x[0-9a-fA-F]+$/i.test(localCrc.trim())) {
-                clientDec = parseInt(localCrc.trim(), 16).toString(10);
-            }
-
-            const isMatch = (clientHex === dbCrcHex) || 
-                            (clientDec === dbCrcDec) || 
-                            (clientCrc === dbCrcHex) || 
-                            (clientCrc === dbCrcDec);
-
-            if (!isMatch) {
-                console.log("❌ CRC MISMATCH DETECTED! DB:", dbCrcHex, "VS Client:", clientHex);
-                return res.status(200).json({ 
-                    success: false, 
-                    error: `Security Error: Library CRC Mismatch! (Wrong Mod Version for this Key)` 
-                });
-            }
-        }
-
-        // Dashboard ke sath compatible device binding & limit check
-        let devices = keyData.devices || {};
-        if (Array.isArray(devices)) {
-            const obj = {};
-            devices.forEach((d, idx) => {
-                if (typeof d === 'object' && d.uuid) obj[d.uuid] = d;
-                else obj['dev_' + idx] = { uuid: d, model: 'Device', lastLogin: Date.now() };
-            });
-            devices = obj;
-        }
-
-        const deviceKeys = Object.keys(devices);
-        const maxDevices = keyData.maxDevices || 1;
-
-        if (!devices[uuid]) {
-            if (deviceKeys.length >= maxDevices) {
-                return res.status(200).json({ success: false, error: `Device limit reached! Max allowed: ${maxDevices}` });
-            }
-            devices[uuid] = {
-                uuid: uuid,
-                model: deviceModel || "Unknown Device",
-                lastLogin: Date.now()
-            };
-        } else {
-            devices[uuid].lastLogin = Date.now();
-            if (deviceModel) devices[uuid].model = deviceModel;
-        }
-
-        await updateFirebaseData(`/keys/${key}.json`, {
-            devices: devices
-        });
-
-        const privateKeyPem = process.env.SERVER_PRIVATE_KEY || `-----BEGIN PRIVATE KEY-----
-MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQCz9Sl59WECdgHo
-yTsFEH1DTQ+UP5pLtD3lV12GiGTHtCzD8eH4DfyKKqamOT9gYKY6jKjL3p8TbndK
-iKGxseCS0bmDO2C1WebKxgfP5ttWUkLbFKdmo888F5kNnslB17P2mLB/t60ytGxT
-U7yYWzptIRZhF22uHQEoHM+885bIFpa/0EZWuP2Ssc/XpOGF55Ucfs2+n/cMr/3m
-TKJvz6V3y8+hRmuwpYJou5W25u6UKys5uDm/hvFfYXy48PF+dX4p8umQGwbj7kwM
-UJyT59o97HuaQZ/8aSER49qq3C9NCJkk9srNmpfJpnAfh/dOhgkEOn+Fu4VE+/fc
-u77mox95AgMBAAECggEADTlm4t91UYj6evDOtYCQs/Flw68o14dXRRM2fDxpq4NC
-BuQvhtsAQ+b+eBic36g6jvLnNJQXfIYRnhiMSVKY/jELQOmMIceJfj0vNcfxNla1
-MwRBiPlgsTnKtYWFpKEFSInP7pLA14kKrNTqdwe9M2fLDTd7h9/5xcjYOzprSii+
-/7ZpeC0yxbbN0uSVfSKvEjAHLXAWa0JLxGGWN1cqqwTAdAZuyHKoIX4nWO9iAQpy
-lDCplH538rs1RJcHMrY//aU3PKsoa6fq3YrPW8bBJHuvRZaJWuS+Cz2O9xjs1Mui
-Utt3X7+JZLXPF37ZL25r0UVRCnjkWQi/O6JjmOxgAQKBgQDzXMClCWvCoShmoOUF
-oQTttTSEhTsZiRyzY2tSkNZhabBATre5P+0n4cBMddfCrHP7aAn8iGV+rXaocJPS
-zzooEYUqRgFtY8r8t9Gg82lZK+hGBv5WFS9Mv7vHoEa2lcsMup8maGfowKTpK3hc
-bBMuCjrDPzKVZ/p0CkNGSoSlOQKBgQC9TYLPTcw5FnMcJ0//hgut8tHeMjQujwTi
-ZUDa4NBVzKZuiXlJCbu5kADFDNI0Yzn4m+1LZlSqw5wofiRcQM16dbTt93lvdsO1
-GYKMtkg8buOw1HFFkyCwmdUIln8mVq8jCKcLj1sFj21WnkUmdS43sn8v9FvsW+J1
-IXsQP2qMQQKBgAI7UoTw7i0Nv0oZpaAElv/7Dm08r4sPZ9T5T22laGHiTzx3vFWV
-kX4xIstQtVbSsAmZLaZENfIQcyseRSzEu7rMVlVJ6Q9wv9bLdL+uG8Q2k924iLKP
-ZSymAXnWLW/VNdR7DaSThohq49hDjsoCL7bXXyyVMsiN+I0B3xYQ7uB5AoGANidC
-UIN09K/TZi5o2DREixJ3rxS1kMwhHZLRpsvBTYop4l05cQdzyHXFgplUWOA56UDR
-9Uvk1KT4uyy6whlXrryVca3l81kKS3hsvEw5BfDC+gcMEFcydtLK+pXy8cjCeUc0
-Yj40T7bkFG9aYNIM0qohcFp7IXZ3pgJZ7h/2HwECgYB8BaPKeFzDeDj4yEllz1At
-4olmd5Bpjj5RfXU13MMtwfVPADLbABIHqSxIbLT+laAihAHVmKfFnNy0Qi83Cp3H
-7UstdB8WoglGKWaNHUX8kKmPUI/PBpBPoQ6evVhjeVrUhoHBAhg+xP0YJJ9c2Ra9
-u8Q9vCVQAIehzfysfIGo8A==
------END PRIVATE KEY-----`;
-
-        const now = Math.floor(Date.now() / 1000);
-        const exp = now + 3600; 
-        const assignedRole = role || "user";
-
-        const payloadData = { 
-            app: "com.alfas.xD", 
-            iat: now,
-            exp: exp, 
-            uuid: uuid, 
-            nonce: nonce,
-            role: assignedRole 
-        };
-        
-        const payloadStr = JSON.stringify(payloadData);
-        
-        const sign = crypto.createSign('SHA256');
-        sign.update(payloadStr);
-        sign.end();
-        const signatureBuffer = sign.sign(privateKeyPem);
-        const signatureHex = signatureBuffer.toString('hex');
-
-        const token = `${payloadStr}:${signatureHex}`;
-
-        return res.status(200).json({ success: true, token: token });
-
-    } catch (err) {
-        return res.status(200).json({ success: false, error: err.message });
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    if (Math.abs(nowSeconds - clientTime) > MAX_CLOCK_SKEW_SECONDS) {
+      return send(res, 401, { success: false, error: 'Login request expired; please retry' });
     }
+
+    // Validate server signing configuration before consuming a nonce or changing Firebase.
+    const signingKey = getSigningKey();
+    const db = getDatabase();
+    const keyRef = db.ref(`keys/${key}`);
+    const initialSnapshot = await keyRef.once('value');
+    const initialKeyData = initialSnapshot.val();
+
+    if (!initialKeyData) {
+      return send(res, 401, { success: false, error: 'Key does not exist' });
+    }
+    if (!isActiveKey(initialKeyData)) {
+      return send(res, 403, { success: false, error: 'Key is inactive or revoked' });
+    }
+    if (!crcMatches(initialKeyData, localCrc)) {
+      return send(res, 403, { success: false, error: 'Library version check failed' });
+    }
+
+    // Atomically reserve this nonce. A repeated request with the same nonce is rejected.
+    // Keep usedNonces protected from all untrusted clients in Firebase rules.
+    const nonceHash = crypto.createHash('sha256')
+      .update(`${APP_ID}:${uuid}:${nonce}`)
+      .digest('hex');
+    const nonceRef = db.ref(`usedNonces/${nonceHash}`);
+    const nonceTransaction = await nonceRef.transaction((current) => {
+      if (current !== null) return;
+      return {
+        createdAt: Date.now(),
+        app: APP_ID,
+        uuidHash: crypto.createHash('sha256').update(uuid).digest('hex')
+      };
+    }, undefined, false);
+
+    if (!nonceTransaction.committed) {
+      return send(res, 409, { success: false, error: 'Login request already used' });
+    }
+
+    // A transaction on the whole key record prevents simultaneous logins from
+    // bypassing the device limit. Role is read only from this trusted DB record.
+    const model = safeDeviceModel(deviceModel);
+    let transactionFailure = '';
+    const keyTransaction = await keyRef.transaction((current) => {
+      transactionFailure = '';
+      if (!current || typeof current !== 'object') {
+        transactionFailure = 'KEY_NOT_FOUND';
+        return;
+      }
+      if (!isActiveKey(current)) {
+        transactionFailure = 'KEY_INACTIVE';
+        return;
+      }
+      if (!crcMatches(current, localCrc)) {
+        transactionFailure = 'CRC_MISMATCH';
+        return;
+      }
+
+      const devices = normalizeDevices(current.devices);
+      const maxDevicesValue = Number(current.maxDevices);
+      const maxDevices = Number.isInteger(maxDevicesValue) && maxDevicesValue >= 1 && maxDevicesValue <= 100
+        ? maxDevicesValue : 1;
+
+      if (!devices[uuid] && Object.keys(devices).length >= maxDevices) {
+        transactionFailure = 'DEVICE_LIMIT';
+        return;
+      }
+
+      devices[uuid] = {
+        uuid,
+        model,
+        lastLogin: Date.now()
+      };
+      current.devices = devices;
+      return current;
+    }, undefined, false);
+
+    if (!keyTransaction.committed) {
+      if (transactionFailure === 'DEVICE_LIMIT') {
+        return send(res, 403, { success: false, error: 'Device limit reached' });
+      }
+      if (transactionFailure === 'KEY_INACTIVE') {
+        return send(res, 403, { success: false, error: 'Key is inactive or revoked' });
+      }
+      if (transactionFailure === 'CRC_MISMATCH') {
+        return send(res, 403, { success: false, error: 'Library version check failed' });
+      }
+      if (transactionFailure === 'KEY_NOT_FOUND') {
+        return send(res, 401, { success: false, error: 'Key does not exist' });
+      }
+      return send(res, 409, { success: false, error: 'Login conflict; please retry' });
+    }
+
+    const committedKeyData = keyTransaction.snapshot.val() || initialKeyData;
+    const assignedRole = trustedRole(committedKeyData); // Never use body.role.
+    const now = Math.floor(Date.now() / 1000);
+    const payloadData = {
+      app: APP_ID,
+      iat: now,
+      exp: now + TOKEN_LIFETIME_SECONDS,
+      uuid,
+      nonce,
+      role: assignedRole
+    };
+
+    const payloadStr = JSON.stringify(payloadData);
+    // RSA-SHA256 / PKCS#1 v1.5 matches EVP_DigestVerify(..., EVP_sha256(), ...)
+    // in the Android C++ client.
+    const signatureHex = crypto.sign('RSA-SHA256', Buffer.from(payloadStr, 'utf8'), signingKey).toString('hex');
+    const token = `${payloadStr}:${signatureHex}`;
+
+    return send(res, 200, { success: true, token });
+  } catch (err) {
+    // Do not return internal errors, credentials, or Firebase details to clients.
+    console.error('Login API error:', err && err.message ? err.message : 'unknown');
+    return send(res, 500, { success: false, error: 'Authentication service unavailable' });
+  }
 };
