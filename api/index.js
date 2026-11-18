@@ -164,7 +164,7 @@ module.exports = async (req, res) => {
       return send(res, 403, { success: false, error: 'Key is inactive or revoked' });
     }
 
-    console.log('CRC check debug:', { clientCrc, dbExpectedCrc32: initialKeyData.expectedCrc32 });
+    console.log('CRC check debug:', { localCrc, dbExpectedCrc32: initialKeyData.expectedCrc32 });
     if (!crcMatches(initialKeyData, localCrc)) {
       console.log('CRC mismatch:', { client: localCrc, expected: initialKeyData.expectedCrc32 });
       return send(res, 403, { success: false, error: 'Library version check failed' });
@@ -217,7 +217,7 @@ module.exports = async (req, res) => {
 
       devices[uuid] = {
         uuid,
-        model,
+      model,
         lastLogin: Date.now()
       };
       current.devices = devices;
