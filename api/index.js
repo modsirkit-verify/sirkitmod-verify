@@ -6,7 +6,7 @@ const admin = require('firebase-admin');
 const FIREBASE_DB_URL = 'https://modsirkit-a625b-default-rtdb.firebaseio.com';
 const APP_ID = 'com.alfas.xD';
 const ALLOWED_ROLES = new Set(['user', 'admin', 'owner']);
-const MAX_CLOCK_SKEW_SECONDS = 300;
+const MAX_CLOCK_SKEW_SECONDS = 86400; // Time skew limit badha kar 24 hours kar di gayi hai
 const TOKEN_LIFETIME_SECONDS = 60 * 60;
 
 function send(res, status, body) {
@@ -102,7 +102,6 @@ function validFirebaseKey(value) {
 }
 
 function validUuid(value) {
-  // Firebase child keys cannot contain . # $ [ ] / or control characters.
   return typeof value === 'string' && value.length >= 8 && value.length <= 128 &&
     /^[A-Za-z0-9:_-]+$/.test(value);
 }
@@ -126,18 +125,21 @@ module.exports = async (req, res) => {
     const body = req.body && typeof req.body === 'object' ? req.body : {};
     const { key, uuid, deviceModel, localCrc, nonce, appId, clientTime } = body;
 
+    console.log('Incoming login request:', { key, uuid, appId, clientTime });
+
     if (!validFirebaseKey(key) || !validUuid(uuid) ||
         typeof nonce !== 'string' || !/^[0-9a-f]{64}$/i.test(nonce) ||
         appId !== APP_ID || typeof clientTime !== 'number' || !Number.isSafeInteger(clientTime)) {
+      console.log('Validation failed for body fields');
       return send(res, 400, { success: false, error: 'Invalid login request' });
     }
 
     const nowSeconds = Math.floor(Date.now() / 1000);
     if (Math.abs(nowSeconds - clientTime) > MAX_CLOCK_SKEW_SECONDS) {
+      console.log('Clock skew exceeded:', { nowSeconds, clientTime, diff: Math.abs(nowSeconds - clientTime) });
       return send(res, 401, { success: false, error: 'Login request expired; please retry' });
     }
 
-    // Validate server signing configuration before consuming a nonce or changing Firebase.
     const signingKey = getSigningKey();
     const db = getDatabase();
     const keyRef = db.ref(`keys/${key}`);
@@ -145,17 +147,18 @@ module.exports = async (req, res) => {
     const initialKeyData = initialSnapshot.val();
 
     if (!initialKeyData) {
+      console.log('Key does not exist in DB:', key);
       return send(res, 401, { success: false, error: 'Key does not exist' });
     }
     if (!isActiveKey(initialKeyData)) {
+      console.log('Key is inactive or revoked:', key);
       return send(res, 403, { success: false, error: 'Key is inactive or revoked' });
     }
     if (!crcMatches(initialKeyData, localCrc)) {
+      console.log('CRC mismatch:', { client: localCrc, expected: initialKeyData.expectedCrc32 });
       return send(res, 403, { success: false, error: 'Library version check failed' });
     }
 
-    // Atomically reserve this nonce. A repeated request with the same nonce is rejected.
-    // Keep usedNonces protected from all untrusted clients in Firebase rules.
     const nonceHash = crypto.createHash('sha256')
       .update(`${APP_ID}:${uuid}:${nonce}`)
       .digest('hex');
@@ -170,11 +173,10 @@ module.exports = async (req, res) => {
     }, undefined, false);
 
     if (!nonceTransaction.committed) {
+      console.log('Nonce already used');
       return send(res, 409, { success: false, error: 'Login request already used' });
     }
 
-    // A transaction on the whole key record prevents simultaneous logins from
-    // bypassing the device limit. Role is read only from this trusted DB record.
     const model = safeDeviceModel(deviceModel);
     let transactionFailure = '';
     const keyTransaction = await keyRef.transaction((current) => {
@@ -212,6 +214,7 @@ module.exports = async (req, res) => {
     }, undefined, false);
 
     if (!keyTransaction.committed) {
+      console.log('Key transaction failed with reason:', transactionFailure);
       if (transactionFailure === 'DEVICE_LIMIT') {
         return send(res, 403, { success: false, error: 'Device limit reached' });
       }
@@ -228,7 +231,7 @@ module.exports = async (req, res) => {
     }
 
     const committedKeyData = keyTransaction.snapshot.val() || initialKeyData;
-    const assignedRole = trustedRole(committedKeyData); // Never use body.role.
+    const assignedRole = trustedRole(committedKeyData);
     const now = Math.floor(Date.now() / 1000);
     const payloadData = {
       app: APP_ID,
@@ -240,14 +243,12 @@ module.exports = async (req, res) => {
     };
 
     const payloadStr = JSON.stringify(payloadData);
-    // RSA-SHA256 / PKCS#1 v1.5 matches EVP_DigestVerify(..., EVP_sha256(), ...)
-    // in the Android C++ client.
     const signatureHex = crypto.sign('RSA-SHA256', Buffer.from(payloadStr, 'utf8'), signingKey).toString('hex');
     const token = `${payloadStr}:${signatureHex}`;
 
+    console.log('Login successful for key:', key);
     return send(res, 200, { success: true, token });
   } catch (err) {
-    // Do not return internal errors, credentials, or Firebase details to clients.
     console.error('Login API error:', err && err.message ? err.message : 'unknown');
     return send(res, 500, { success: false, error: 'Authentication service unavailable' });
   }
