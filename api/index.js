@@ -75,9 +75,13 @@ function parseCrc32(value) {
   return null;
 }
 
-function crcMatches(keyData, clientCrc) {
+function crcMatches(keyData, globalIntegrity, clientCrc) {
   const actual = parseCrc32(clientCrc);
-  const expected = parseCrc32(keyData.expectedCrc32) ?? parseCrc32(keyData.expectedCrc32Dec);
+  // Checks key-specific CRC first, falls back to Admin Panel's Global Lib Config
+  const expected = parseCrc32(keyData.expectedCrc32) 
+                ?? parseCrc32(keyData.expectedCrc32Dec) 
+                ?? parseCrc32(globalIntegrity.libCrcHash) 
+                ?? parseCrc32(globalIntegrity.libCrcDecimal);
   return actual !== null && expected !== null && actual === expected;
 }
 
@@ -151,9 +155,18 @@ module.exports = async (req, res) => {
 
     const signingKey = getSigningKey();
     const db = getDatabase();
+
+    // Fetch key data and global integrity settings concurrently
     const keyRef = db.ref(`keys/${key}`);
-    const initialSnapshot = await keyRef.once('value');
+    const integrityRef = db.ref('system_settings/lib_integrity');
+    
+    const [initialSnapshot, integritySnapshot] = await Promise.all([
+      keyRef.once('value'),
+      integrityRef.once('value')
+    ]);
+
     const initialKeyData = initialSnapshot.val();
+    const globalIntegrity = integritySnapshot.val() || {};
 
     if (!initialKeyData) {
       console.log('Key does not exist in DB:', key);
@@ -164,9 +177,9 @@ module.exports = async (req, res) => {
       return send(res, 403, { success: false, error: 'Key is inactive or revoked' });
     }
 
-    console.log('CRC check debug:', { localCrc, dbExpectedCrc32: initialKeyData.expectedCrc32 });
-    if (!crcMatches(initialKeyData, localCrc)) {
-      console.log('CRC mismatch:', { client: localCrc, expected: initialKeyData.expectedCrc32 });
+    console.log('CRC check debug:', { localCrc, dbCrc: initialKeyData.expectedCrc32, globalCrc: globalIntegrity.libCrcHash });
+    if (!crcMatches(initialKeyData, globalIntegrity, localCrc)) {
+      console.log('CRC mismatch:', { client: localCrc });
       return send(res, 403, { success: false, error: 'Library version check failed' });
     }
 
@@ -200,7 +213,7 @@ module.exports = async (req, res) => {
         transactionFailure = 'KEY_INACTIVE';
         return;
       }
-      if (!crcMatches(current, localCrc)) {
+      if (!crcMatches(current, globalIntegrity, localCrc)) {
         transactionFailure = 'CRC_MISMATCH';
         return;
       }
@@ -217,7 +230,7 @@ module.exports = async (req, res) => {
 
       devices[uuid] = {
         uuid,
-      model,
+        model,
         lastLogin: Date.now()
       };
       current.devices = devices;
