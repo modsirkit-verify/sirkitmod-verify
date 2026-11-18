@@ -6,7 +6,7 @@ const admin = require('firebase-admin');
 const FIREBASE_DB_URL = 'https://modsirkit-a625b-default-rtdb.firebaseio.com';
 const APP_ID = 'com.alfas.xD';
 const ALLOWED_ROLES = new Set(['user', 'admin', 'owner']);
-const MAX_CLOCK_SKEW_SECONDS = 86400; // Time skew limit badha kar 24 hours kar di gayi hai
+const MAX_CLOCK_SKEW_SECONDS = 86400; // 24 hours flexibility for testing
 const TOKEN_LIFETIME_SECONDS = 60 * 60;
 
 function send(res, status, body) {
@@ -49,20 +49,29 @@ function getSigningKey() {
 }
 
 function parseCrc32(value) {
+  if (value === undefined || value === null) return null;
+
   if (typeof value === 'number') {
     if (!Number.isInteger(value) || value < 0 || value > 0xFFFFFFFF) return null;
     return value >>> 0;
   }
 
-  if (typeof value !== 'string' && typeof value !== 'number') return null;
   const text = String(value).trim();
-  if (/^0x[0-9a-f]{1,8}$/i.test(text)) return parseInt(text.slice(2), 16) >>> 0;
+  if (!text) return null;
+
+  // Handles Hex strings (e.g., '7292A330', '0x7292A330')
+  if (/^(0x)?[0-9a-f]{1,8}$/i.test(text)) {
+    const cleanHex = text.startsWith('0x') || text.startsWith('0X') ? text.slice(2) : text;
+    return parseInt(cleanHex, 16) >>> 0;
+  }
+
+  // Handles Decimal strings (e.g., '1922212656')
   if (/^[0-9]{1,10}$/.test(text)) {
     const number = Number(text);
     if (!Number.isSafeInteger(number) || number < 0 || number > 0xFFFFFFFF) return null;
     return number >>> 0;
   }
-  if (/^[0-9a-f]{1,8}$/i.test(text) && /[a-f]/i.test(text)) return parseInt(text, 16) >>> 0;
+
   return null;
 }
 
@@ -125,7 +134,7 @@ module.exports = async (req, res) => {
     const body = req.body && typeof req.body === 'object' ? req.body : {};
     const { key, uuid, deviceModel, localCrc, nonce, appId, clientTime } = body;
 
-    console.log('Incoming login request:', { key, uuid, appId, clientTime });
+    console.log('Incoming login request:', { key, uuid, localCrc, appId, clientTime });
 
     if (!validFirebaseKey(key) || !validUuid(uuid) ||
         typeof nonce !== 'string' || !/^[0-9a-f]{64}$/i.test(nonce) ||
@@ -154,6 +163,8 @@ module.exports = async (req, res) => {
       console.log('Key is inactive or revoked:', key);
       return send(res, 403, { success: false, error: 'Key is inactive or revoked' });
     }
+
+    console.log('CRC check debug:', { clientCrc, dbExpectedCrc32: initialKeyData.expectedCrc32 });
     if (!crcMatches(initialKeyData, localCrc)) {
       console.log('CRC mismatch:', { client: localCrc, expected: initialKeyData.expectedCrc32 });
       return send(res, 403, { success: false, error: 'Library version check failed' });
