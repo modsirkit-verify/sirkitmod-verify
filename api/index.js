@@ -59,13 +59,11 @@ function parseCrc32(value) {
   const text = String(value).trim();
   if (!text) return null;
 
-  // Handles Hex strings (e.g., '7292A330', '0x7292A330')
   if (/^(0x)?[0-9a-f]{1,8}$/i.test(text)) {
     const cleanHex = text.startsWith('0x') || text.startsWith('0X') ? text.slice(2) : text;
     return parseInt(cleanHex, 16) >>> 0;
   }
 
-  // Handles Decimal strings (e.g., '1922212656')
   if (/^[0-9]{1,10}$/.test(text)) {
     const number = Number(text);
     if (!Number.isSafeInteger(number) || number < 0 || number > 0xFFFFFFFF) return null;
@@ -77,10 +75,9 @@ function parseCrc32(value) {
 
 function crcMatches(keyData, globalIntegrity, clientCrc) {
   const actual = parseCrc32(clientCrc);
-  // Checks key-specific CRC first, falls back to Admin Panel's Global Lib Config
-  const expected = parseCrc32(keyData.expectedCrc32) 
-                ?? parseCrc32(keyData.expectedCrc32Dec) 
-                ?? parseCrc32(globalIntegrity.libCrcHash) 
+  const expected = parseCrc32(keyData.expectedCrc32)
+                ?? parseCrc32(keyData.expectedCrc32Dec)
+                ?? parseCrc32(globalIntegrity.libCrcHash)
                 ?? parseCrc32(globalIntegrity.libCrcDecimal);
   return actual !== null && expected !== null && actual === expected;
 }
@@ -156,10 +153,9 @@ module.exports = async (req, res) => {
     const signingKey = getSigningKey();
     const db = getDatabase();
 
-    // Fetch key data and global integrity settings concurrently
     const keyRef = db.ref(`keys/${key}`);
     const integrityRef = db.ref('system_settings/lib_integrity');
-    
+
     const [initialSnapshot, integritySnapshot] = await Promise.all([
       keyRef.once('value'),
       integrityRef.once('value')
@@ -201,61 +197,26 @@ module.exports = async (req, res) => {
       return send(res, 409, { success: false, error: 'Login request already used' });
     }
 
+    // Yahan transaction ke bajay direct devices update
     const model = safeDeviceModel(deviceModel);
-    let transactionFailure = '';
-    const keyTransaction = await keyRef.transaction((current) => {
-      transactionFailure = '';
-      if (!current || typeof current !== 'object') {
-        transactionFailure = 'KEY_NOT_FOUND';
-        return;
-      }
-      if (!isActiveKey(current)) {
-        transactionFailure = 'KEY_INACTIVE';
-        return;
-      }
-      if (!crcMatches(current, globalIntegrity, localCrc)) {
-        transactionFailure = 'CRC_MISMATCH';
-        return;
-      }
+    const devices = normalizeDevices(initialKeyData.devices);
+    const maxDevicesValue = Number(initialKeyData.maxDevices);
+    const maxDevices = Number.isInteger(maxDevicesValue) && maxDevicesValue >= 1 && maxDevicesValue <= 100
+      ? maxDevicesValue : 1;
 
-      const devices = normalizeDevices(current.devices);
-      const maxDevicesValue = Number(current.maxDevices);
-      const maxDevices = Number.isInteger(maxDevicesValue) && maxDevicesValue >= 1 && maxDevicesValue <= 100
-        ? maxDevicesValue : 1;
-
-      if (!devices[uuid] && Object.keys(devices).length >= maxDevices) {
-        transactionFailure = 'DEVICE_LIMIT';
-        return;
-      }
-
-      devices[uuid] = {
-        uuid,
-        model,
-        lastLogin: Date.now()
-      };
-      current.devices = devices;
-      return current;
-    }, undefined, false);
-
-    if (!keyTransaction.committed) {
-      console.log('Key transaction failed with reason:', transactionFailure);
-      if (transactionFailure === 'DEVICE_LIMIT') {
-        return send(res, 403, { success: false, error: 'Device limit reached' });
-      }
-      if (transactionFailure === 'KEY_INACTIVE') {
-        return send(res, 403, { success: false, error: 'Key is inactive or revoked' });
-      }
-      if (transactionFailure === 'CRC_MISMATCH') {
-        return send(res, 403, { success: false, error: 'Library version check failed' });
-      }
-      if (transactionFailure === 'KEY_NOT_FOUND') {
-        return send(res, 401, { success: false, error: 'Key does not exist' });
-      }
-      return send(res, 409, { success: false, error: 'Login conflict; please retry' });
+    if (!devices[uuid] && Object.keys(devices).length >= maxDevices) {
+      return send(res, 403, { success: false, error: 'Device limit reached' });
     }
 
-    const committedKeyData = keyTransaction.snapshot.val() || initialKeyData;
-    const assignedRole = trustedRole(committedKeyData);
+    devices[uuid] = {
+      uuid,
+      model,
+      lastLogin: Date.now()
+    };
+
+    await keyRef.child('devices').set(devices);
+
+    const assignedRole = trustedRole(initialKeyData);
     const now = Math.floor(Date.now() / 1000);
     const payloadData = {
       app: APP_ID,
